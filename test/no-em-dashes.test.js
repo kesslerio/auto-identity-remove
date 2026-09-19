@@ -26,8 +26,11 @@ const { execFileSync } = require('node:child_process');
 
 const ROOT = path.join(__dirname, '..');
 
-const EM_DASH = '—';
-const EN_DASH = '–';
+// Written as escapes, not literals: this file is itself tracked, so a literal
+// dash here would be flagged by the scan below. The escapes resolve to the
+// same characters at runtime, so detection is unaffected.
+const EM_DASH = '\u2014';
+const EN_DASH = '\u2013';
 
 /** Tracked files, so generated and ignored content is out of scope. */
 function trackedFiles() {
