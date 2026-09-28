@@ -30,7 +30,7 @@ const FEEDS_PATH      = path.join(__dirname, 'data', 'feeds-brokers.json');
 const DEAD_URLS_PATH  = path.join(__dirname, 'data', 'dead-urls.json');
 
 const { detectConfirmationRequired } = require('./lib/confirm');
-const { CONFIRM_RECHECK_DAYS, loadConfig } = require('./lib/config');
+const { CONFIRM_RECHECK_DAYS, ERROR_RECHECK_DAYS, loadConfig, loadCheckpoint, findResumeIndex, saveCheckpoint } = require('./lib/config');
 const { withRetry } = require('./lib/retry');
 const { isAllowlisted } = require('./lib/filter');
 
@@ -332,8 +332,28 @@ async function processGenericUrl(page, broker, state, dryRun = false, injectedDe
           return { status: 'skipped', detail: `pending confirm - retry in ${Math.max(0, Math.round(CONFIRM_RECHECK_DAYS - ageDays))}d` };
         }
         // confirmation window elapsed → fall through to re-attempt
-      } else if (ageDays < RECHECK_DAYS) {
-        return { status: 'skipped', detail: `${Math.round(ageDays)}d ago` };
+      } else {
+        // Successes cool down for RECHECK_DAYS from the last success; failures
+        // back off for ERROR_RECHECK_DAYS so restarts make forward progress
+        // instead of re-hitting the same failing brokers from the top.
+        // --retry-failed forces re-attempts, so it bypasses the failure
+        // backoff only (success cooldown still applies).
+        const successDays = entry.lastSuccess
+          ? (Date.now() - new Date(entry.lastSuccess).getTime()) / 86400000
+          : Infinity;
+        if (successDays < RECHECK_DAYS) {
+          return { status: 'skipped', detail: `${Math.round(successDays)}d ago` };
+        }
+        // The last attempt failed (it is newer than any success, or there was
+        // never a success) and is inside the backoff window → skip unless
+        // --retry-failed was passed.
+        const lastSuccessTime = entry.lastSuccess ? new Date(entry.lastSuccess).getTime() : -Infinity;
+        const lastAttemptTime = entry.lastAttempt ? new Date(entry.lastAttempt).getTime() : -Infinity;
+        const attemptDays = (Date.now() - lastAttemptTime) / 86400000;
+        if (attemptDays < ERROR_RECHECK_DAYS && lastAttemptTime >= lastSuccessTime && !opts.retryFailed) {
+          const left = Math.max(0, Math.round(ERROR_RECHECK_DAYS - attemptDays));
+          return { status: 'skipped', detail: `last attempt failed - retry in ${left}d` };
+        }
       }
     }
   }
@@ -570,13 +590,39 @@ async function runGenericBrokers(context, explicitBrokerHosts, state, logResult,
   const RECYCLE_EVERY = 25; // periodically replace the working page to bound renderer growth
   let processed = 0;
 
+  // --resume: jump straight to the broker that was in flight when the last run
+  // died, instead of walking the whole list again. Brokers before the
+  // checkpoint are skipped entirely - their outcomes are already recorded in
+  // state (or the checkpoint is stale/missing and we run everything, with
+  // state-based skips still applying per broker).
+  let brokerList = brokers;
+  if (opts.resume) {
+    const ckpt = loadCheckpoint();
+    if (ckpt) {
+      const ckptIdx = findResumeIndex(brokerList, ckpt, person, personCount);
+      if (ckptIdx > 0) {
+        console.log(`\n--resume: skipping ${ckptIdx} generic broker(s) before "${ckpt}"`);
+        brokerList = brokerList.slice(ckptIdx);
+      } else if (ckptIdx === -1) {
+        console.log(`\n--resume: checkpoint "${ckpt}" not in generic list, running all`);
+      }
+    } else {
+      console.log('\n--resume: no checkpoint found, running all generic brokers');
+    }
+  }
+
   try {
-    for (const broker of brokers) {
+    for (const broker of brokerList) {
       process.stdout.write(`\n  [${broker.name.slice(0,40)}]… `);
+
+      // Checkpoint BEFORE processing (mirrors lib/broker-runner.js): if the
+      // run dies mid-broker, --resume restarts at this broker, not the next.
+      const recordKey = keyFor(broker.name);
+      saveCheckpoint(recordKey);
 
       let result;
       try {
-        result = await processFn(page, broker, state, dryRun, opts.injectedDeadSet, { person, stateKey: keyFor(broker.name) });
+        result = await processFn(page, broker, state, dryRun, opts.injectedDeadSet, { person, stateKey: recordKey, retryFailed: !!opts.retryFailed });
       } catch (err) {
         // One broker must never abort the whole run or skip the cleanup below.
         result = { status: 'error', detail: (err && err.message ? err.message.slice(0, 80) : 'error') };
@@ -599,7 +645,6 @@ async function runGenericBrokers(context, explicitBrokerHosts, state, logResult,
 
       // All three record under the per-person key so one household member's
       // success never suppresses another's submission.
-      const recordKey = keyFor(broker.name);
       if (result.status === 'success') {
         recordSuccess(recordKey, result.detail || '');
       } else if (result.status === 'pending_confirm') {

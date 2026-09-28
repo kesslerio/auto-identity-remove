@@ -84,3 +84,66 @@ test('every chromium launch site in watcher.js goes through lib/browser', () => 
     + `found ${optionCalls.length}. A launch site with hand-rolled options silently loses the container flags.`,
   );
 });
+
+test('buildLaunchArgs adds --proxy-server only when AIDR_PROXY is set', () => {
+  const withProxy = buildLaunchArgs({ platform: 'linux', env: { AIDR_PROXY: 'http://127.0.0.1:18888' } });
+  assert.ok(withProxy.includes('--proxy-server=http://127.0.0.1:18888'));
+  const without = buildLaunchArgs({ platform: 'linux', env: {} });
+  assert.ok(!without.some(a => a.startsWith('--proxy-server=')), 'no proxy flag without AIDR_PROXY');
+});
+
+test('proxyUrl reads AIDR_PROXY', () => {
+  const { proxyUrl } = require('../lib/browser');
+  assert.equal(proxyUrl({ AIDR_PROXY: 'http://127.0.0.1:18888' }), 'http://127.0.0.1:18888');
+  assert.equal(proxyUrl({}), undefined);
+});
+
+test('ensureNssDb copies the system DB to a writable HOME and is idempotent', () => {
+  const os = require('node:os');
+  const { ensureNssDb } = require('../lib/browser');
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'aidr-nss-test-'));
+  const env = { HOME: fakeHome };
+  const first = ensureNssDb(env);
+  assert.equal(first, path.join(fakeHome, '.chrome-home'));
+  const destDb = path.join(fakeHome, '.chrome-home', '.pki', 'nssdb', 'cert9.db');
+  assert.ok(fs.existsSync(destDb), 'writable copy of the NSS DB must exist');
+  const mtime1 = fs.statSync(path.join(fakeHome, '.chrome-home', '.pki', 'nssdb', '.aidr-nss-ready')).mtimeMs;
+  const second = ensureNssDb(env);
+  assert.equal(second, first);
+  const mtime2 = fs.statSync(path.join(fakeHome, '.chrome-home', '.pki', 'nssdb', '.aidr-nss-ready')).mtimeMs;
+  assert.equal(mtime2, mtime1, 'second call must not re-copy');
+  fs.rmSync(fakeHome, { recursive: true, force: true });
+});
+
+test('ensureNssDb never throws and returns undefined without a system DB', () => {
+  const { ensureNssDb } = require('../lib/browser');
+  // Point HOME somewhere harmless; the function must survive any FS state.
+  assert.doesNotThrow(() => ensureNssDb({ HOME: '/nonexistent-home-xyz' }));
+});
+
+test('proxyReachable: true for a listening socket, false for a closed port', async () => {
+  const net = require('node:net');
+  const { proxyReachable } = require('../lib/browser');
+  const server = net.createServer();
+  await new Promise((res) => server.listen(0, '127.0.0.1', res));
+  const port = server.address().port;
+  assert.equal(await proxyReachable(`http://127.0.0.1:${port}`, 2000), true);
+  await new Promise((res) => server.close(res));
+  assert.equal(await proxyReachable(`http://127.0.0.1:${port}`, 2000), false);
+});
+
+test('proxyReachable: false for a malformed URL, never throws', async () => {
+  const { proxyReachable } = require('../lib/browser');
+  assert.equal(await proxyReachable('not a url', 1000), false);
+});
+
+test('watcher.js fail-fast: proxy check runs before the main-run browser launch', () => {
+  const watcher = fs.readFileSync(path.join(__dirname, '..', 'watcher.js'), 'utf8');
+  const checkIdx = watcher.indexOf('_proxyReachable(proxy)');
+  // The main opt-out run's launch site (other modes launch in their own branches).
+  const launchIdx = watcher.indexOf('launchPersistentContext(profileDir, buildLaunchOptions({ headless }))');
+  assert.ok(checkIdx > 0, 'watcher must call the proxy reachability check');
+  assert.ok(launchIdx > 0, 'watcher must launch the main-run browser');
+  assert.ok(checkIdx < launchIdx, 'proxy check must run before the main-run browser launch');
+  assert.ok(watcher.includes('Refusing to run'), 'dead proxy must abort with a clear message');
+});

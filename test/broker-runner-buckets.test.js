@@ -230,7 +230,9 @@ test('failure post-submit: recordSuccess is NOT called', async () => {
 });
 
 // B13: a dead HTTP status (404/410/5xx) on the opt-out URL must short-circuit
-// BEFORE the form is filled/submitted, logging 'error' (not success/unverified).
+// BEFORE the form is filled/submitted, logging 'dead' (not success/unverified
+// and not 'error': the URL itself is gone, matching generic-runner's
+// isDeadStatus classification).
 function makeContextWithStatus(statusCode) {
   return {
     newPage: async () => ({
@@ -242,7 +244,7 @@ function makeContextWithStatus(statusCode) {
   };
 }
 
-test('B13: opt-out URL returning HTTP 404 short-circuits to error, no success', async () => {
+test('B13: opt-out URL returning HTTP 404 short-circuits to dead, no success', async () => {
   clearAll();
   classifyReturn = { outcome: 'success', snippet: 'request received' }; // would falsely "succeed" if not short-circuited
   configure({ dryRun: false, person: PERSON, capsolver: null });
@@ -251,10 +253,11 @@ test('B13: opt-out URL returning HTTP 404 short-circuits to error, no success', 
 
   const entry = logged.find(l => l.name === DIRECT_BROKER.name);
   assert.ok(entry, 'a result should be logged');
-  assert.equal(entry.status, 'error', 'a 404 opt-out page must log error');
+  assert.equal(entry.status, 'dead', 'a 404 opt-out page must log dead');
   assert.match(entry.detail, /HTTP 404/);
   assert.equal(recorded.success.length, 0, 'must NOT record success for a 404 page');
   assert.equal(recorded.failure.length, 1, 'must record a failure for a 404 page');
+  assert.equal(recorded.failure[0].kind, 'dead', 'a 404 page must record failure kind dead');
 });
 
 test('B13: HTTP 200 does NOT short-circuit (normal flow continues)', async () => {

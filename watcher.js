@@ -24,7 +24,7 @@ const { addToAllowlist, removeFromAllowlist, parseAllowlistArgs } = require('./l
 const { diffResults, loadPreviousLog } = require('./lib/diff');
 const { renderAuditMarkdown, writeAuditFile, timestampForFilename } = require('./lib/audit');
 const { buildStealthScript } = require('./lib/stealth');
-const { buildLaunchOptions, resolveHeadless, isLowMemory } = require('./lib/browser');
+const { buildLaunchOptions, resolveHeadless, isLowMemory, installTrackerBlocking } = require('./lib/browser');
 
 const PREVIEW           = process.argv.includes('--preview');
 const DRY_RUN           = process.argv.includes('--dry-run') || PREVIEW; // --preview implies --dry-run
@@ -768,7 +768,7 @@ if (KNOW_MODE) {
   });
 } else {
 
-brokerRunner.configure({ dryRun: DRY_RUN, preview: PREVIEW, person: persons[0], capsolver: config.capsolver, noCapsolver: NO_CAPSOLVER, snapshot: SNAPSHOT, personCount: persons.length, config });
+brokerRunner.configure({ dryRun: DRY_RUN, preview: PREVIEW, person: persons[0], capsolver: config.capsolver, noCapsolver: NO_CAPSOLVER, snapshot: SNAPSHOT, personCount: persons.length, config, retryFailed: RETRY_FAILED });
 
 // Detect brokers that have been consistently unreachable across recent runs.
 // Defunct brokers still run - the warning is informational so the user can
@@ -807,6 +807,8 @@ const stamp = () => new Date().toLocaleTimeString();
 
 const LOCK_PATH = STATE_PATH + '.lock';
 
+const { proxyReachable: _proxyReachable } = require('./lib/browser');
+
 async function main() {
   // Acquire process lock to prevent concurrent runs racing on state.json
   try {
@@ -837,6 +839,33 @@ async function _mainBody() {
   console.log(`📅 ${new Date().toLocaleString()}`);
   console.log(`📋 ${brokers.length} explicit brokers + 500+ generic | re-check window: ${RECHECK_DAYS} days\n`);
 
+  // Fail fast when a proxy is configured but unreachable: without this, a
+  // dead forwarder turns every broker into a recorded page.goto error and
+  // the whole run is a wash (seen 2026-09-19: 97 bogus errors).
+  const proxy = process.env.AIDR_PROXY;
+  if (proxy) {
+    let ok = await _proxyReachable(proxy);
+    if (!ok) {
+      // One self-heal attempt: the stock forwarder script, when present.
+      const fwdScript = path.join(os.homedir(), 'workspace', 'bin', 'ensure-forwarder.sh');
+      if (fs.existsSync(fwdScript)) {
+        console.log('🔌 Proxy unreachable - trying to (re)start the egress forwarder…');
+        try {
+          require('node:child_process').execFileSync('bash', [fwdScript], { timeout: 30000 });
+          await new Promise((r) => setTimeout(r, 2000));
+          ok = await _proxyReachable(proxy);
+        } catch (_) { /* fall through to the hard failure below */ }
+      }
+    }
+    if (!ok) {
+      console.error(`\n❌ AIDR_PROXY=${proxy} is not reachable. Start the egress forwarder first:`);
+      console.error('   bash ~/workspace/bin/ensure-forwarder.sh');
+      console.error('   Refusing to run: every broker navigation would fail.\n');
+      process.exit(1);
+    }
+    console.log(`🔌 Proxy: ${proxy} (reachable)`);
+  }
+
   // Launch persistent browser (reuses profile / saved logins)
   fs.mkdirSync(profileDir, { recursive: true });
 
@@ -849,6 +878,11 @@ async function _mainBody() {
 
   const context = await chromium.launchPersistentContext(profileDir, buildLaunchOptions({ headless }));
   await context.addInitScript(buildStealthScript());
+  // Block tracker/ad-tech requests: every third-party domain the browser
+  // touches becomes a CONNECT through the egress proxy, which can surface a
+  // per-site approval prompt on sandboxed runtimes. Pure blocklist, so real
+  // form infrastructure is untouched.
+  const trackerBlockedCount = await installTrackerBlocking(context);
 
   // ── Resolve --retry-failed broker set ──────────────────────────────────────
   let retryFailedFromLog;
@@ -999,7 +1033,7 @@ async function _mainBody() {
 
     const submissionEmail = submissionEmails.get(person);
 
-    brokerRunner.configure({ dryRun: DRY_RUN, preview: PREVIEW, person, capsolver: config.capsolver, noCapsolver: NO_CAPSOLVER, snapshot: SNAPSHOT, personCount: persons.length, config, submissionEmail });
+    brokerRunner.configure({ dryRun: DRY_RUN, preview: PREVIEW, person, capsolver: config.capsolver, noCapsolver: NO_CAPSOLVER, snapshot: SNAPSHOT, personCount: persons.length, config, submissionEmail, retryFailed: RETRY_FAILED });
 
     // Rebuild the broker list for THIS person, then apply the run filter
     // BEFORE anything in the list can act. brokers.js interpolates names,
@@ -1107,6 +1141,8 @@ async function _mainBody() {
       dryRun: DRY_RUN,
       person,
       personCount: persons.length,
+      resume: RESUME,
+      retryFailed: RETRY_FAILED,
       ...(genericBrokers ? { injectedBrokers: genericBrokers } : {}),
     });
     if (genericResult && genericResult.genericStats) {
